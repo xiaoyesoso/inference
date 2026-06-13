@@ -1363,6 +1363,35 @@
   },
   {
     "version": 2,
+    "model_name": "PaddleOCR-VL-1.6",
+    "model_family": "ocr",
+    "model_ability": [
+      "ocr"
+    ],
+    "virtualenv": {
+      "packages": [
+        "pillow==11.3.0",
+        "transformers @ git+https://github.com/huggingface/transformers.git",
+        "accelerate>=0.28.0",
+        "#system_numpy#",
+        "#system_torch#"
+      ]
+    },
+    "model_src": {
+      "huggingface": {
+        "model_id": "PaddlePaddle/PaddleOCR-VL-1.6",
+        "model_revision": "main"
+      },
+      "modelscope": {
+        "model_id": "PaddlePaddle/PaddleOCR-VL-1.6",
+        "model_revision": "master"
+      }
+    },
+    "updated_at": 1781350696,
+    "featured": true
+  },
+  {
+    "version": 2,
     "model_name": "Qwen-Image-Layered",
     "model_family": "stable_diffusion",
     "model_ability": [

@@ -27,13 +27,20 @@ logger = logging.getLogger(__name__)
 
 
 class PaddleOCRVLModel(OCRModel):
-    """PaddleOCR-VL model for OCR, table recognition, formula recognition, and chart recognition."""
+    """PaddleOCR-VL model for OCR, table recognition, formula recognition, chart recognition, seal recognition and text spotting.
+
+    Supports both PaddleOCR-VL (initial release) and PaddleOCR-VL-1.6, which
+    share the same model architecture and inference protocol but differ in
+    weights and required transformers version.
+    """
 
     required_libs = ("transformers",)
 
+    SUPPORTED_MODEL_NAMES = {"PaddleOCR-VL", "PaddleOCR-VL-1.6"}
+
     @classmethod
     def match(cls, model_family: "ImageModelFamilyV2") -> bool:
-        return model_family.model_name == "PaddleOCR-VL"
+        return model_family.model_name in cls.SUPPORTED_MODEL_NAMES
 
     def __init__(
         self,
@@ -107,7 +114,9 @@ class PaddleOCRVLModel(OCRModel):
         Args:
             image: PIL Image or list of PIL Images
             **kwargs: Additional parameters including:
-                - task: Task type ('ocr', 'table', 'formula', 'chart'), default: 'ocr'
+                - task: Task type ('ocr', 'table', 'formula', 'chart',
+                  'spotting', 'seal'), default: 'ocr'. The 'spotting' and
+                  'seal' tasks are only meaningful for PaddleOCR-VL-1.6+.
                 - prompt: Custom prompt (optional, overrides task-based prompt)
                 - max_new_tokens: Maximum number of tokens to generate (default: 1024)
                 - return_dict: Whether to return a dictionary with metadata (default: False)
@@ -126,12 +135,19 @@ class PaddleOCRVLModel(OCRModel):
         max_new_tokens = kwargs.get("max_new_tokens", 1024)
         return_dict = kwargs.get("return_dict", False)
 
-        # Define task prompts
+        # Define task prompts. PaddleOCR-VL-1.6 introduces additional
+        # 'spotting' and 'seal' tasks; older PaddleOCR-VL releases only
+        # ship the four base tasks. Sending an unknown prompt to a model
+        # that does not understand it will simply produce a less accurate
+        # result, so we expose all prompts uniformly and let the underlying
+        # model handle it.
         PROMPTS = {
             "ocr": "OCR:",
             "table": "Table Recognition:",
             "formula": "Formula Recognition:",
             "chart": "Chart Recognition:",
+            "spotting": "Spotting:",
+            "seal": "Seal Recognition:",
         }
 
         # Use custom prompt if provided, otherwise use task-based prompt
@@ -142,7 +158,7 @@ class PaddleOCRVLModel(OCRModel):
 
         # Handle single image input
         if isinstance(image, PIL.Image.Image):
-            result = self._process_single(image, prompt, max_new_tokens)
+            result = self._process_single(image, prompt, max_new_tokens, task)
             if return_dict:
                 return {
                     "text": result,
@@ -155,7 +171,7 @@ class PaddleOCRVLModel(OCRModel):
         # Handle batch image input
         elif isinstance(image, list):
             results = [
-                self._process_single(img, prompt, max_new_tokens) for img in image
+                self._process_single(img, prompt, max_new_tokens, task) for img in image
             ]
             if return_dict:
                 return {
@@ -171,9 +187,21 @@ class PaddleOCRVLModel(OCRModel):
             raise ValueError("Input must be a PIL Image or list of PIL Images")
 
     def _process_single(
-        self, image: PIL.Image.Image, prompt: str, max_new_tokens: int
+        self,
+        image: PIL.Image.Image,
+        prompt: str,
+        max_new_tokens: int,
+        task: str = "ocr",
     ) -> str:
-        """Process a single image with the given prompt."""
+        """Process a single image with the given prompt.
+
+        For the ``spotting`` task on small images (<1500px on both
+        dimensions), we follow the official PaddleOCR-VL-1.6 reference and
+        upscale by 2x using LANCZOS to improve detection accuracy. The
+        underlying processor's ``max_pixels`` is also bumped from the
+        default ~1M pixels to 1605632 (2048 * 28 * 28) for the spotting
+        task to keep the longer side from being aggressively downsampled.
+        """
         # Ensure model and processor are loaded
         assert self._model is not None, "Model not loaded. Call load() first."
         assert self._processor is not None, "Processor not loaded. Call load() first."
@@ -181,6 +209,25 @@ class PaddleOCRVLModel(OCRModel):
         # Convert image to RGB if needed
         if image.mode in ["RGBA", "CMYK"]:
             image = image.convert("RGB")
+
+        # Spotting upscale: small images benefit from 2x upscaling so that
+        # the vision tower sees enough pixels for fine-grained character
+        # localization.
+        spotting_upscale_threshold = 1500
+        if (
+            task == "spotting"
+            and image.width < spotting_upscale_threshold
+            and image.height < spotting_upscale_threshold
+        ):
+            try:
+                resample_filter = PIL.Image.Resampling.LANCZOS
+            except AttributeError:
+                resample_filter = PIL.Image.LANCZOS
+            image = image.resize((image.width * 2, image.height * 2), resample_filter)
+
+        # Decide max_pixels: spotting needs more visual detail, every other
+        # task uses the processor's default (~1M pixels = 1280 * 28 * 28).
+        max_pixels = 2048 * 28 * 28 if task == "spotting" else 1280 * 28 * 28
 
         # Get device
         device = next(self._model.parameters()).device
@@ -196,14 +243,33 @@ class PaddleOCRVLModel(OCRModel):
             }
         ]
 
-        # Apply chat template
-        inputs = self._processor.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
-            return_tensors="pt",
-        ).to(device)
+        # Apply chat template. ``images_kwargs`` is forwarded into the
+        # underlying image processor so we can override the max_pixels per
+        # task (PaddleOCR-VL-1.6 reference uses this exact key).
+        try:
+            inputs = self._processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt",
+                images_kwargs={
+                    "size": {
+                        "shortest_edge": self._processor.image_processor.min_pixels,
+                        "longest_edge": max_pixels,
+                    }
+                },
+            ).to(device)
+        except TypeError:
+            # Older PaddleOCR-VL processors may not accept ``images_kwargs``;
+            # fall back to the plain call.
+            inputs = self._processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt",
+            ).to(device)
 
         # Generate
         with torch.inference_mode():
